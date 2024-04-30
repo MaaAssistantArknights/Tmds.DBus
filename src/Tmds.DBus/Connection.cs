@@ -10,6 +10,8 @@ using System.Threading;
 using System.Threading.Tasks;
 using Tmds.DBus.CodeGen;
 using Tmds.DBus.Protocol;
+using System.IO;
+using Tmds.DBus.Transports;
 
 namespace Tmds.DBus
 {
@@ -162,6 +164,14 @@ namespace Tmds.DBus
             {
                 throw new NotSupportedException($"Unknown ConnectionOptions type: '{typeof(ConnectionOptions).FullName}'");
             }
+        }
+
+        internal Connection(DBusConnection dbusConnection)
+        {
+            _connectionType = ConnectionType.ClientManual;
+            _state = ConnectionState.Connected;
+            _dbusConnection = dbusConnection;
+            _dbusConnectionTask = Task.FromResult(_dbusConnection);
         }
 
         /// <summary>
@@ -1058,6 +1068,18 @@ namespace Tmds.DBus
             var newConnection = new Connection(new ClientConnectionOptions(address) { AutoConnect = true, SynchronizationContext = null });
             Interlocked.CompareExchange(ref connection, newConnection, null);
             return connection;
+        }
+
+        /// <summary>
+        /// Create a client connection from a stream.
+        /// </summary>
+        /// <param name="stream"></param>
+        /// <returns></returns>
+        public static async Task<Connection> CreateClientConnectionFromStream(Stream stream)
+        {
+            var transport = await StreamTransport.AttachAsClient(stream, new AddressEntry(), new ClientSetupResult());
+            var dbusconn = await DBusConnection.CreateAndConnectAsync(transport);
+            return new Connection(dbusconn);
         }
     }
 }
