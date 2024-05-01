@@ -43,6 +43,14 @@ public partial class Connection : IDisposable
         _connectionOptions = (ClientConnectionOptions)connectionOptions;
     }
 
+    public static async ValueTask<Connection> AttachAsClientAsync(Stream stream, Guid guid, string? userId) {
+        var connection = new Connection(new ClientConnectionOptions("") { AutoConnect = false, IsShared = false});
+        var msgstream = new MessageStream(stream);
+        await msgstream.DoClientAuthAsync(guid, userId, false);
+        connection.Connect(new MessageStream(stream));
+        return connection;
+    }
+
     // For tests.
     internal void Connect(IMessageStream stream)
     {

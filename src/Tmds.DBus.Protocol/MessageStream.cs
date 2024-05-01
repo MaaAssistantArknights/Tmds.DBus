@@ -9,7 +9,9 @@ namespace Tmds.DBus.Protocol;
 class MessageStream : IMessageStream
 {
     private static readonly ReadOnlyMemory<byte> OneByteArray = new[] { (byte)0 };
-    private readonly Socket _socket;
+    private readonly Socket? _socket;
+    private readonly Stream? _stream;
+    private readonly bool _useStream;
     private UnixFdCollection? _fdCollection;
     private bool _supportsFdPassing;
     private readonly MessagePool _messagePool;
@@ -25,9 +27,7 @@ class MessageStream : IMessageStream
     private Exception? _completionException;
     private bool _isMonitor;
 
-    public MessageStream(Socket socket)
-    {
-        _socket = socket;
+    private MessageStream() {
         Channel<MessageBuffer> channel = Channel.CreateUnbounded<MessageBuffer>(new UnboundedChannelOptions
         {
             AllowSynchronousContinuations = true,
@@ -41,6 +41,57 @@ class MessageStream : IMessageStream
         _pipeWriter = pipe.Writer;
         _messagePool = new();
     }
+
+    public MessageStream(Socket socket) : this()
+    {
+        _socket = socket;
+        _stream = null;
+        _useStream = false;
+    }
+
+    public MessageStream(Stream stream) : this()
+    {
+        _socket = null;
+        _stream = stream;
+        _useStream = true;
+    }
+
+    private ValueTask TransportSendAsync(ReadOnlyMemory<byte> memory, IReadOnlyList<SafeHandle>? handles)
+    {
+        if (_useStream)
+        {
+            return _stream!.WriteAsync(memory);
+        }
+        else
+        {
+            return _socket!.SendAsync(memory, handles);
+        }
+    }
+
+    private async ValueTask TransportSendAsync(ReadOnlyMemory<byte> memory)
+    {
+        if (_useStream)
+        {
+            await _stream!.WriteAsync(memory);
+        }
+        else
+        {
+            await _socket!.SendAsync(memory, SocketFlags.None);
+        }
+    }
+
+    private ValueTask<int> TransportReceiveAsync(Memory<byte> memory, UnixFdCollection? fdCollection)
+    {
+        if (_useStream)
+        {
+            return _stream!.ReadAsync(memory);
+        }
+        else
+        {
+            return _socket!.ReceiveAsync(memory, fdCollection);
+        }
+    }
+
 
     public void BecomeMonitor()
     {
@@ -56,7 +107,7 @@ class MessageStream : IMessageStream
             while (true)
             {
                 Memory<byte> memory = writer.GetMemory(1024);
-                int bytesRead = await _socket.ReceiveAsync(memory, _fdCollection).ConfigureAwait(false);
+                int bytesRead = await TransportReceiveAsync(memory, _fdCollection).ConfigureAwait(false);
                 if (bytesRead == 0)
                 {
                     throw new IOException("Connection closed by peer");
@@ -89,14 +140,14 @@ class MessageStream : IMessageStream
                 var buffer = message.AsReadOnlySequence();
                 if (buffer.IsSingleSegment)
                 {
-                    await _socket.SendAsync(buffer.First, handles).ConfigureAwait(false);
+                    await TransportSendAsync(buffer.First, handles).ConfigureAwait(false);
                 }
                 else
                 {
                     SequencePosition position = buffer.Start;
                     while (buffer.TryGet(ref position, out ReadOnlyMemory<byte> memory))
                     {
-                        await _socket.SendAsync(memory, handles).ConfigureAwait(false);
+                        await TransportSendAsync(memory, handles).ConfigureAwait(false);
                         handles = null;
                     }
                 }
@@ -165,7 +216,7 @@ class MessageStream : IMessageStream
         ReadFromSocketIntoPipe();
 
         // send 1 byte
-        await _socket.SendAsync(OneByteArray, SocketFlags.None).ConfigureAwait(false);
+        await TransportSendAsync(OneByteArray).ConfigureAwait(false);
         // auth
         var authenticationResult = await SendAuthCommandsAsync(userId, supportsFdPassing).ConfigureAwait(false);
         _supportsFdPassing = authenticationResult.SupportsFdPassing;
@@ -334,7 +385,7 @@ class MessageStream : IMessageStream
     {
         int length = Encoding.ASCII.GetBytes(message.AsSpan(), lineBuffer.Span);
         lineBuffer = lineBuffer.Slice(0, length);
-        await _socket.SendAsync(lineBuffer, SocketFlags.None).ConfigureAwait(false);
+        await TransportSendAsync(lineBuffer).ConfigureAwait(false);
     }
 
     private async ValueTask<int> ReadLineAsync(Memory<byte> lineBuffer)
@@ -395,7 +446,14 @@ class MessageStream : IMessageStream
         Exception? previous = Interlocked.CompareExchange(ref _completionException, closeReason, null);
         if (previous is null)
         {
-            _socket?.Dispose();
+            if (_useStream)
+            {
+                _stream?.Dispose();
+            }
+            else
+            {
+                _socket?.Dispose();
+            }
             _messageWriter.Complete();
         }
         return previous ?? closeReason;
